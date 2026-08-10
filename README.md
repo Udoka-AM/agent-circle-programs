@@ -11,7 +11,7 @@ Anchor programs backing the Agent Circle marketplace.
 
 Program ID (devnet): `22rFHvivAX4hDwx3NdwfQ1hsyorwDFxc9JLy5WcZV7x6`
 
----
+--
 
 ## Quick start
 
@@ -35,7 +35,7 @@ the two steps separately; the IDL step uses the host toolchain, which is already
 new enough.
 
 Override with `SBF_TOOLS_VERSION=v1.52 yarn build` if needed. Versions v1.53+ fail
-with a missing `core` crate against this CLI.
+with a missing `core` crate against this CLI
 
 ---
 
@@ -74,7 +74,7 @@ with a missing `core` crate against this CLI.
   ≤ 5%, builder split ≥ 50%. `approve_listing(null)` applies the locked launch
   defaults (0 / 1000 / 8000 bps, 1200 position cap, 1500 max drawdown).
 - **Slashing splits 70/30** between harmed traders and the buyback pool. Never 100%
-  to treasury, which would create an incentive to slash.
+  to treasury, which would create an incentive to slash
 
 ### Deviation from the spec
 
@@ -103,4 +103,4 @@ program can never be upgraded at this address.
 - `agent-vault` — blocked on the venue whitelist decision (see spec §9.1)
 - Bond tier amounts — currently supplied per-call; production values pending the
   $AGENT price/float decision (spec §9.2)
-- Independent audit — required before any real funds
+- Independent audit — required before any real funds.

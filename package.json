@@ -5,6 +5,7 @@
     "build": "./scripts/build.sh",
     "test": "./scripts/build.sh && anchor test --skip-build",
     "test:fast": "anchor test --skip-build",
+    "devnet:walkthrough": "ts-node scripts/devnet-walkthrough.ts",
     "lint:fix": "prettier */*.js \"*/**/*{.js,.ts}\" -w",
     "lint": "prettier */*.js \"*/**/*{.js,.ts}\" --check"
   },

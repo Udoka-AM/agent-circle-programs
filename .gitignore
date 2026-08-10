@@ -5,3 +5,6 @@ target
 node_modules
 test-ledger
 .yarn
+
+# devnet walkthrough state — contains a generated builder secret key
+scripts/.devnet-walkthrough.json
