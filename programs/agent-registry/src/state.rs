@@ -115,6 +115,73 @@ impl Config {
     }
 }
 
+/// Which privileged config change a `PendingChange` carries.
+///
+/// Three explicit queue instructions rather than one generic one, deliberately: spec
+/// §11.4 requires multisig signers to decode proposed instruction data rather than trust
+/// a description of it, and `queue_transfer_authority` is far harder to misread in a
+/// Squads simulation than `queue_change(kind: 0, ...)`.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, Debug, InitSpace)]
+pub enum ActionKind {
+    TransferAuthority,
+    SetVaultAuthority,
+    UpdateTiers,
+}
+
+impl ActionKind {
+    /// Seed byte, so each kind occupies its own PDA slot and two different pending
+    /// changes cannot displace one another.
+    pub fn seed(&self) -> u8 {
+        match self {
+            ActionKind::TransferAuthority => 0,
+            ActionKind::SetVaultAuthority => 1,
+            ActionKind::UpdateTiers => 2,
+        }
+    }
+}
+
+/// Governance parameters, held apart from `Config` on purpose.
+///
+/// A separate PDA rather than new fields on `Config`: the config account is already live
+/// on devnet, and growing it would mean a realloc migration for no benefit. Governance
+/// state is also genuinely separable from economic state — the two change on different
+/// schedules and for different reasons.
+///
+/// Until this account exists, the three timelocked instructions cannot run at all. That
+/// is the intended failure mode: a registry with no guardian should refuse to hand over
+/// its authority rather than allow it unguarded.
+#[account]
+#[derive(InitSpace)]
+pub struct Governance {
+    /// Can veto any pending change and pause any listing, and can never propose
+    /// anything. The asymmetry is the point — compromising the guardian gains an
+    /// attacker no power to act, only the power to obstruct.
+    pub guardian: Pubkey,
+    pub timelock_delay: i64,
+    pub bump: u8,
+}
+
+/// A privileged config change that has been announced but is not yet real.
+///
+/// Flat rather than an enum with payloads: every field is visible in a decoded
+/// simulation, and a governance object is the wrong place to be clever.
+#[account]
+#[derive(InitSpace)]
+pub struct PendingChange {
+    pub kind: ActionKind,
+    /// Target for `TransferAuthority` and `SetVaultAuthority`. Unused otherwise.
+    pub new_key: Pubkey,
+    /// Payload for `UpdateTiers`. Unused otherwise.
+    pub tier_bonds: [u64; TIER_COUNT],
+    pub tier_ceilings: [u64; TIER_COUNT],
+    /// Earliest timestamp at which this may execute.
+    pub eta: i64,
+    pub queued_at: i64,
+    /// Who funded the account, and therefore who the rent returns to on execute or veto.
+    pub payer: Pubkey,
+    pub bump: u8,
+}
+
 #[account]
 #[derive(InitSpace)]
 pub struct Builder {

@@ -10,6 +10,13 @@ name = "agent_registry"
 
 [features]
 default = []
+# Lowers MIN_TIMELOCK_DELAY so a successful timelocked execution is reachable in an
+# integration test. A validator's clock cannot be warped, so without this the only way to
+# exercise the happy path would be to sleep for an hour.
+#
+# NEVER enable for a devnet or mainnet build. `scripts/build.sh` does not pass it; only
+# `scripts/build.sh --localnet` does, and that is what the test script uses.
+localnet = []
 cpi = ["no-entrypoint"]
 no-entrypoint = []
 no-idl = []

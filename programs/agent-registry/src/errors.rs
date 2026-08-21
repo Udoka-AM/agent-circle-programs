@@ -56,6 +56,21 @@ pub enum RegistryError {
     #[msg("Assets under management would exceed the builder's tier ceiling")]
     AumCeilingExceeded,
 
+    #[msg("Only the guardian or the multisig authority may perform this action")]
+    NotGuardianOrAuthority,
+    #[msg("Only the guardian may perform this action")]
+    NotGuardian,
+    #[msg("Governance has not been initialised; privileged config changes are unavailable")]
+    GovernanceUnset,
+    #[msg("Timelock delay is outside the permitted range")]
+    InvalidTimelockDelay,
+    #[msg("The timelock on this change has not elapsed")]
+    TimelockNotElapsed,
+    #[msg("Pending change does not match the requested action")]
+    PendingChangeKindMismatch,
+    #[msg("Rent refund must go to the account that paid for the pending change")]
+    WrongRentRecipient,
+
     #[msg("Arithmetic overflow")]
     MathOverflow,
 }

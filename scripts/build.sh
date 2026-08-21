@@ -20,11 +20,29 @@ TOOLS_VERSION="${SBF_TOOLS_VERSION:-v1.52}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# --localnet lowers MIN_TIMELOCK_DELAY to 2s so the governance happy path is testable
+# against a validator, whose clock cannot be warped. Anything deployed anywhere real must
+# be built WITHOUT it; the default below is the safe one, and it is not switchable by
+# environment variable on purpose.
+FEATURES=""
+LABEL="production defaults"
+if [[ "${1:-}" == "--localnet" ]]; then
+  FEATURES="--features localnet"
+  LABEL="LOCALNET — 2s timelock floor, DO NOT DEPLOY"
+fi
+
 mkdir -p target/idl target/types
 
-echo "▸ Building program (platform-tools ${TOOLS_VERSION})"
+echo "▸ Building program (platform-tools ${TOOLS_VERSION}, ${LABEL})"
+# shellcheck disable=SC2086
 cargo-build-sbf --tools-version "${TOOLS_VERSION}" \
-  --manifest-path programs/agent-registry/Cargo.toml
+  --manifest-path programs/agent-registry/Cargo.toml ${FEATURES}
+
+# Which profile produced the .so currently sitting in target/deploy. `test:fast` reads
+# this and refuses to run against a production binary, whose 1-hour timelock floor makes
+# the governance tests fail in a way that looks like a code bug rather than a stale build.
+# Learned the hard way.
+echo "${LABEL}" > target/deploy/.build-profile
 
 echo "▸ Generating IDL and TypeScript types"
 anchor idl build \

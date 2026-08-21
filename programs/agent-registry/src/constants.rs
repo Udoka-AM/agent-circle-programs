@@ -8,6 +8,10 @@ pub const BUILDER_SEED: &[u8] = b"builder";
 pub const AGENT_SEED: &[u8] = b"agent";
 #[constant]
 pub const BOND_SEED: &[u8] = b"bond";
+#[constant]
+pub const GOVERNANCE_SEED: &[u8] = b"governance";
+#[constant]
+pub const PENDING_SEED: &[u8] = b"pending";
 
 pub const BPS_DENOMINATOR: u64 = 10_000;
 
@@ -18,6 +22,27 @@ pub const DEFAULT_UNBOND_PERIOD: i64 = 14 * 24 * 60 * 60;
 /// Upper bound on the governance-settable unbonding period (90 days), so a
 /// misconfiguration cannot strand builder bonds indefinitely.
 pub const MAX_UNBOND_PERIOD: i64 = 90 * 24 * 60 * 60;
+
+/// 72 hours. Spec §11.3: the delay between a governance change being announced and
+/// becoming real is the whole defence — it converts a silent instant seizure into a
+/// public, observable pending change that the guardian and anyone watching can react to.
+pub const DEFAULT_TIMELOCK_DELAY: i64 = 72 * 60 * 60;
+
+/// A delay short enough to be outrun is not a delay. The floor exists so a careless
+/// authority cannot initialise governance with a delay of zero and leave the guardian no
+/// window at all. (`set_timelock_delay` is increase-only for the same reason, so the
+/// floor only ever binds at initialisation.)
+#[cfg(not(feature = "localnet"))]
+pub const MIN_TIMELOCK_DELAY: i64 = 60 * 60;
+
+/// Test-only. A validator's clock cannot be warped, so exercising a *successful*
+/// timelocked execution means really waiting — which is only tolerable at a few seconds.
+/// Guarded by a feature the production build script never passes.
+#[cfg(feature = "localnet")]
+pub const MIN_TIMELOCK_DELAY: i64 = 2;
+
+/// Bounded above so a mistake cannot freeze governance permanently.
+pub const MAX_TIMELOCK_DELAY: i64 = 30 * 24 * 60 * 60;
 
 // ——— Locked launch parameters (see docs/onchain/agent-registry-and-vault.md §0) ———
 pub const DEFAULT_LISTING_FEE_BPS: u16 = 0;

@@ -65,32 +65,13 @@ pub struct UpdateConfig<'info> {
     pub authority: Signer<'info>,
 }
 
-/// Tiers are fixed token counts rather than USD-pegged (no oracle dependency),
-/// so the multisig needs a way to revise them if $AGENT price moves materially.
-pub fn update_tiers(
-    ctx: Context<UpdateConfig>,
-    tier_bonds: [u64; TIER_COUNT],
-    tier_ceilings: [u64; TIER_COUNT],
-) -> Result<()> {
-    let config = &mut ctx.accounts.config;
-    config.tier_bonds = tier_bonds;
-    config.tier_ceilings = tier_ceilings;
-    config.validate_tiers()?;
-
-    msg!("Tiers updated");
-    Ok(())
-}
-
-/// Set once `agent_vault` is deployed. Until then no account can report AUM.
-pub fn set_vault_authority(ctx: Context<UpdateConfig>, vault_authority: Pubkey) -> Result<()> {
-    ctx.accounts.config.vault_authority = vault_authority;
-    msg!("Vault authority set to {}", vault_authority);
-    Ok(())
-}
-
-/// Governance lever. Bounded above so a mistake cannot lock builder bonds
-/// indefinitely; no lower bound, since shortening it only reduces the
-/// multisig's own window to catch fraud.
+/// Governance lever, and the only config change that still applies immediately.
+///
+/// Bounded above so a mistake cannot lock builder bonds indefinitely; no lower bound,
+/// since shortening it only reduces the multisig's *own* window to catch fraud. It grants
+/// no power over funds and cannot be pointed at an attacker's account, which is why it
+/// does not go through the timelock while `transfer_authority`, `set_vault_authority` and
+/// `update_tiers` all do — see `instructions/governance.rs`.
 pub fn set_unbond_period(ctx: Context<UpdateConfig>, unbond_period: i64) -> Result<()> {
     require!(
         unbond_period > 0 && unbond_period <= MAX_UNBOND_PERIOD,
@@ -98,11 +79,5 @@ pub fn set_unbond_period(ctx: Context<UpdateConfig>, unbond_period: i64) -> Resu
     );
     ctx.accounts.config.unbond_period = unbond_period;
     msg!("Unbond period set to {}s", unbond_period);
-    Ok(())
-}
-
-pub fn transfer_authority(ctx: Context<UpdateConfig>, new_authority: Pubkey) -> Result<()> {
-    ctx.accounts.config.authority = new_authority;
-    msg!("Authority transferred to {}", new_authority);
     Ok(())
 }

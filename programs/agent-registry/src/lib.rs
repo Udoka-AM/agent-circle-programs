@@ -17,7 +17,7 @@ pub mod state;
 
 use constants::TIER_COUNT;
 use instructions::*;
-use state::FeeConfig;
+use state::{ActionKind, FeeConfig};
 
 declare_id!("22rFHvivAX4hDwx3NdwfQ1hsyorwDFxc9JLy5WcZV7x6");
 
@@ -47,20 +47,64 @@ pub mod agent_registry {
         instructions::config::set_unbond_period(ctx, unbond_period)
     }
 
-    pub fn update_tiers(
-        ctx: Context<UpdateConfig>,
+    // ——— governance: timelock and guardian (spec §11) ———
+    //
+    // `transfer_authority`, `set_vault_authority` and `update_tiers` used to apply
+    // immediately. They no longer exist as direct instructions — each can hand an
+    // attacker the registry, so each is now queue-wait-execute with a guardian able to
+    // veto during the wait. See `instructions/governance.rs`.
+
+    pub fn initialize_governance(
+        ctx: Context<InitializeGovernance>,
+        guardian: Pubkey,
+        timelock_delay: Option<i64>,
+    ) -> Result<()> {
+        instructions::governance::initialize_governance(ctx, guardian, timelock_delay)
+    }
+
+    pub fn set_guardian(ctx: Context<SetGuardian>, new_guardian: Pubkey) -> Result<()> {
+        instructions::governance::set_guardian(ctx, new_guardian)
+    }
+
+    pub fn set_timelock_delay(ctx: Context<SetGuardian>, delay: i64) -> Result<()> {
+        instructions::governance::set_timelock_delay(ctx, delay)
+    }
+
+    pub fn queue_transfer_authority(
+        ctx: Context<QueueChange>,
+        kind: ActionKind,
+        new_authority: Pubkey,
+    ) -> Result<()> {
+        instructions::governance::queue_transfer_authority(ctx, kind, new_authority)
+    }
+
+    pub fn queue_set_vault_authority(
+        ctx: Context<QueueChange>,
+        kind: ActionKind,
+        vault_authority: Pubkey,
+    ) -> Result<()> {
+        instructions::governance::queue_set_vault_authority(ctx, kind, vault_authority)
+    }
+
+    pub fn queue_update_tiers(
+        ctx: Context<QueueChange>,
+        kind: ActionKind,
         tier_bonds: [u64; TIER_COUNT],
         tier_ceilings: [u64; TIER_COUNT],
     ) -> Result<()> {
-        instructions::config::update_tiers(ctx, tier_bonds, tier_ceilings)
+        instructions::governance::queue_update_tiers(ctx, kind, tier_bonds, tier_ceilings)
     }
 
-    pub fn set_vault_authority(ctx: Context<UpdateConfig>, vault_authority: Pubkey) -> Result<()> {
-        instructions::config::set_vault_authority(ctx, vault_authority)
+    pub fn execute_change(ctx: Context<ResolveChange>, kind: ActionKind) -> Result<()> {
+        instructions::governance::execute_change(ctx, kind)
     }
 
-    pub fn transfer_authority(ctx: Context<UpdateConfig>, new_authority: Pubkey) -> Result<()> {
-        instructions::config::transfer_authority(ctx, new_authority)
+    pub fn veto_change(ctx: Context<ResolveChange>, kind: ActionKind) -> Result<()> {
+        instructions::governance::veto_change(ctx, kind)
+    }
+
+    pub fn guardian_pause_listing(ctx: Context<GuardianPauseListing>) -> Result<()> {
+        instructions::governance::guardian_pause_listing(ctx)
     }
 
     // ——— builder identity ———

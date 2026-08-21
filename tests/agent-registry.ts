@@ -15,6 +15,8 @@ const CONFIG_SEED = Buffer.from("config");
 const BUILDER_SEED = Buffer.from("builder");
 const AGENT_SEED = Buffer.from("agent");
 const BOND_SEED = Buffer.from("bond");
+const GOVERNANCE_SEED = Buffer.from("governance");
+const PENDING_SEED = Buffer.from("pending");
 
 // $AGENT is assumed to have 6 decimals for these tests.
 const UNIT = 1_000_000;
@@ -32,6 +34,17 @@ const TIER_CEILINGS: [BN, BN, BN] = [
 
 /// Short enough that the elapsed branch of `withdraw_bond` is reachable in a test.
 const TEST_UNBOND_PERIOD = 2;
+
+/// Matches MIN_TIMELOCK_DELAY under the `localnet` feature. A validator's clock cannot be
+/// warped, so exercising a successful timelocked execution means really waiting.
+const TEST_TIMELOCK_DELAY = 2;
+
+/// Seed byte per ActionKind, mirroring `ActionKind::seed()` in state.rs.
+const KIND = {
+  transferAuthority: { variant: { transferAuthority: {} }, seed: 0 },
+  setVaultAuthority: { variant: { setVaultAuthority: {} }, seed: 1 },
+  updateTiers: { variant: { updateTiers: {} }, seed: 2 },
+} as const;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -59,6 +72,7 @@ describe("agent-registry", () => {
   const outsider = Keypair.generate();
   const vaultAuthority = Keypair.generate();
   const agentBot = Keypair.generate();
+  const guardian = Keypair.generate();
 
   let agentMint: PublicKey;
   let configPda: PublicKey;
@@ -67,6 +81,15 @@ describe("agent-registry", () => {
   let builderAta: PublicKey;
   let traderCompensationAta: PublicKey;
   let buybackAta: PublicKey;
+  let governancePda: PublicKey;
+
+  /// Anchor cannot resolve this one itself: the seed is a byte computed from the action
+  /// kind, which the IDL has no way to express. Passed explicitly at every call site.
+  const pendingPda = (seedByte: number) =>
+    PublicKey.findProgramAddressSync(
+      [PENDING_SEED, Buffer.from([seedByte])],
+      program.programId
+    )[0];
 
   const listingPda = (builder: PublicKey, index: number) =>
     PublicKey.findProgramAddressSync(
@@ -75,7 +98,7 @@ describe("agent-registry", () => {
     )[0];
 
   before(async () => {
-    for (const kp of [authority, builderKp, outsider, vaultAuthority]) {
+    for (const kp of [authority, builderKp, outsider, vaultAuthority, guardian]) {
       const sig = await connection.requestAirdrop(kp.publicKey, 5 * LAMPORTS_PER_SOL);
       await connection.confirmTransaction(sig);
     }
@@ -91,6 +114,7 @@ describe("agent-registry", () => {
       [BOND_SEED, builderPda.toBuffer()],
       program.programId
     );
+    [governancePda] = PublicKey.findProgramAddressSync([GOVERNANCE_SEED], program.programId);
 
     builderAta = await createAssociatedTokenAccount(
       connection, payer, agentMint, builderKp.publicKey
@@ -122,24 +146,57 @@ describe("agent-registry", () => {
       assert.equal(cfg.tierBonds[2].toString(), TIER_BONDS[2].toString());
     });
 
-    it("rejects tier updates from a non-authority", async () => {
+    it("initialises governance with a guardian", async () => {
+      await program.methods
+        .initializeGovernance(guardian.publicKey, new BN(TEST_TIMELOCK_DELAY))
+        .accountsPartial({ authority: authority.publicKey, payer: payer.publicKey })
+        .signers([authority, payer])
+        .rpc();
+
+      const g = await program.account.governance.fetch(governancePda);
+      assert.equal(g.guardian.toBase58(), guardian.publicKey.toBase58());
+      assert.equal(g.timelockDelay.toNumber(), TEST_TIMELOCK_DELAY);
+    });
+
+    it("refuses a guardian that is the authority itself", async () => {
+      // The whole value of the veto key is that compromising the multisig does not also
+      // compromise it. Governance is already initialised, so this also covers re-init.
       await expectError(
         program.methods
-          .updateTiers(TIER_BONDS, TIER_CEILINGS)
-          .accounts({ authority: outsider.publicKey })
+          .initializeGovernance(authority.publicKey, new BN(TEST_TIMELOCK_DELAY))
+          .accountsPartial({ authority: authority.publicKey, payer: payer.publicKey })
+          .signers([authority, payer])
+          .rpc(),
+        "already in use"
+      );
+    });
+
+    it("rejects queued tier updates from a non-authority", async () => {
+      await expectError(
+        program.methods
+          .queueUpdateTiers(KIND.updateTiers.variant, TIER_BONDS, TIER_CEILINGS)
+          .accountsPartial({
+            pending: pendingPda(KIND.updateTiers.seed),
+            authority: outsider.publicKey,
+            payer: outsider.publicKey,
+          })
           .signers([outsider])
           .rpc(),
         "Unauthorized"
       );
     });
 
-    it("rejects non-increasing tier bonds", async () => {
+    it("rejects non-increasing tier bonds at queue time", async () => {
       const bad: [BN, BN, BN] = [new BN(100), new BN(50), new BN(200)];
       await expectError(
         program.methods
-          .updateTiers(bad, TIER_CEILINGS)
-          .accounts({ authority: authority.publicKey })
-          .signers([authority])
+          .queueUpdateTiers(KIND.updateTiers.variant, bad, TIER_CEILINGS)
+          .accountsPartial({
+            pending: pendingPda(KIND.updateTiers.seed),
+            authority: authority.publicKey,
+            payer: payer.publicKey,
+          })
+          .signers([authority, payer])
           .rpc(),
         "TierBondsNotIncreasing"
       );
@@ -416,14 +473,49 @@ describe("agent-registry", () => {
       );
     });
 
-    it("registers the vault authority", async () => {
+    it("registers the vault authority, but only after the timelock", async () => {
       await program.methods
-        .setVaultAuthority(vaultAuthority.publicKey)
-        .accounts({ authority: authority.publicKey })
+        .queueSetVaultAuthority(KIND.setVaultAuthority.variant, vaultAuthority.publicKey)
+        .accountsPartial({
+          pending: pendingPda(KIND.setVaultAuthority.seed),
+          authority: authority.publicKey,
+          payer: payer.publicKey,
+        })
+        .signers([authority, payer])
+        .rpc();
+
+      // Naming the program that reports AUM is the same shape of lever as the one that
+      // drained Drift: point it at a hostile program and it mints ceiling headroom from
+      // nothing. It must not take effect in the transaction that proposes it.
+      let cfg = await program.account.config.fetch(configPda);
+      assert.equal(cfg.vaultAuthority.toBase58(), PublicKey.default.toBase58());
+
+      await expectError(
+        program.methods
+          .executeChange(KIND.setVaultAuthority.variant)
+          .accountsPartial({
+            pending: pendingPda(KIND.setVaultAuthority.seed),
+            signer: authority.publicKey,
+            rentRefund: payer.publicKey,
+          })
+          .signers([authority])
+          .rpc(),
+        "TimelockNotElapsed"
+      );
+
+      await sleep((TEST_TIMELOCK_DELAY + 1) * 1000);
+
+      await program.methods
+        .executeChange(KIND.setVaultAuthority.variant)
+        .accountsPartial({
+          pending: pendingPda(KIND.setVaultAuthority.seed),
+          signer: authority.publicKey,
+          rentRefund: payer.publicKey,
+        })
         .signers([authority])
         .rpc();
 
-      const cfg = await program.account.config.fetch(configPda);
+      cfg = await program.account.config.fetch(configPda);
       assert.equal(cfg.vaultAuthority.toBase58(), vaultAuthority.publicKey.toBase58());
     });
 
@@ -727,6 +819,224 @@ describe("agent-registry", () => {
           .signers([authority])
           .rpc(),
         "InsufficientBond"
+      );
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────────
+  // Governance: the Drift lesson, encoded.
+  //
+  // Drift lost $285M in April 2026 with no bug involved — months of social
+  // engineering ended in admin control. These tests assert that holding the
+  // multisig is not, on its own, enough to take the registry.
+  // ────────────────────────────────────────────────────────────────────────
+  describe("governance", () => {
+    const queueTransfer = (to: PublicKey) =>
+      program.methods
+        .queueTransferAuthority(KIND.transferAuthority.variant, to)
+        .accountsPartial({
+          pending: pendingPda(KIND.transferAuthority.seed),
+          authority: authority.publicKey,
+          payer: payer.publicKey,
+        })
+        .signers([authority, payer])
+        .rpc();
+
+    // `listing0` is scoped to the listings suite; the same PDA, derived locally.
+    const liveListing = () => listingPda(builderPda, 0);
+
+    const resolve = (method: "executeChange" | "vetoChange", signer: Keypair) =>
+      program.methods[method](KIND.transferAuthority.variant)
+        .accountsPartial({
+          pending: pendingPda(KIND.transferAuthority.seed),
+          signer: signer.publicKey,
+          rentRefund: payer.publicKey,
+        })
+        .signers([signer])
+        .rpc();
+
+    it("a compromised authority cannot seize the registry in one transaction", async () => {
+      const attacker = Keypair.generate();
+      await queueTransfer(attacker.publicKey);
+
+      const cfg = await program.account.config.fetch(configPda);
+      assert.equal(
+        cfg.authority.toBase58(),
+        authority.publicKey.toBase58(),
+        "queuing must not transfer anything"
+      );
+
+      await expectError(resolve("executeChange", authority), "TimelockNotElapsed");
+    });
+
+    it("the guardian can veto during the delay", async () => {
+      await resolve("vetoChange", guardian);
+
+      // The pending account is closed by the veto, so nothing is left to execute.
+      const info = await connection.getAccountInfo(
+        PublicKey.findProgramAddressSync(
+          [PENDING_SEED, Buffer.from([KIND.transferAuthority.seed])],
+          program.programId
+        )[0]
+      );
+      assert.isNull(info, "vetoed proposal must be gone");
+    });
+
+    it("the guardian can never propose anything", async () => {
+      await expectError(
+        program.methods
+          .queueTransferAuthority(KIND.transferAuthority.variant, guardian.publicKey)
+          .accountsPartial({
+            pending: pendingPda(KIND.transferAuthority.seed),
+            authority: guardian.publicKey,
+            payer: guardian.publicKey,
+          })
+          .signers([guardian])
+          .rpc(),
+        "Unauthorized"
+      );
+    });
+
+    it("the guardian can never execute, even after the delay", async () => {
+      await queueTransfer(outsider.publicKey);
+      await sleep((TEST_TIMELOCK_DELAY + 1) * 1000);
+
+      await expectError(resolve("executeChange", guardian), "Unauthorized");
+      await resolve("vetoChange", guardian); // clean up
+    });
+
+    it("an outsider can neither execute nor veto", async () => {
+      await queueTransfer(outsider.publicKey);
+
+      await expectError(resolve("executeChange", outsider), "Unauthorized");
+      await expectError(resolve("vetoChange", outsider), "NotGuardianOrAuthority");
+      await resolve("vetoChange", authority); // authority may cancel its own proposal
+    });
+
+    it("a second proposal of the same kind cannot silently displace the first", async () => {
+      await queueTransfer(outsider.publicKey);
+      await expectError(queueTransfer(agentBot.publicKey), "already in use");
+      await resolve("vetoChange", guardian);
+    });
+
+    it("executes once the delay has genuinely elapsed", async () => {
+      const successor = Keypair.generate();
+      await queueTransfer(successor.publicKey);
+      await sleep((TEST_TIMELOCK_DELAY + 1) * 1000);
+      await resolve("executeChange", authority);
+
+      const cfg = await program.account.config.fetch(configPda);
+      assert.equal(cfg.authority.toBase58(), successor.publicKey.toBase58());
+
+      // Hand it back so the remaining suites keep working.
+      await program.methods
+        .queueTransferAuthority(KIND.transferAuthority.variant, authority.publicKey)
+        .accountsPartial({
+          pending: pendingPda(KIND.transferAuthority.seed),
+          authority: successor.publicKey,
+          payer: payer.publicKey,
+        })
+        .signers([successor, payer])
+        .rpc();
+      await sleep((TEST_TIMELOCK_DELAY + 1) * 1000);
+      await program.methods
+        .executeChange(KIND.transferAuthority.variant)
+        .accountsPartial({
+          pending: pendingPda(KIND.transferAuthority.seed),
+          signer: successor.publicKey,
+          rentRefund: payer.publicKey,
+        })
+        .signers([successor])
+        .rpc();
+
+      const restored = await program.account.config.fetch(configPda);
+      assert.equal(restored.authority.toBase58(), authority.publicKey.toBase58());
+    });
+
+    it("the timelock delay can be raised but never lowered", async () => {
+      // Lowering would let a compromised authority shrink the guardian's window to
+      // nothing and then help itself, which would defeat the entire mechanism.
+      await expectError(
+        program.methods
+          .setTimelockDelay(new BN(TEST_TIMELOCK_DELAY))
+          .accountsPartial({ authority: authority.publicKey })
+          .signers([authority])
+          .rpc(),
+        "InvalidTimelockDelay"
+      );
+
+      await program.methods
+        .setTimelockDelay(new BN(TEST_TIMELOCK_DELAY + 1))
+        .accountsPartial({ authority: authority.publicKey })
+        .signers([authority])
+        .rpc();
+
+      const g = await program.account.governance.fetch(governancePda);
+      assert.equal(g.timelockDelay.toNumber(), TEST_TIMELOCK_DELAY + 1);
+    });
+
+    it("the guardian can stop a live agent instantly, with no delay", async () => {
+      // Spec §11.3 item 4: emergency response must always be faster than emergency
+      // damage. Waiting out a timelock to stop an agent that is actively losing other
+      // people's money would be absurd, so pausing is immediate and unilateral.
+      let l = await program.account.agentListing.fetch(liveListing());
+      if (!("live" in l.status)) {
+        await program.methods
+          .resumeListing()
+          .accountsPartial({ builder: builderPda, listing: liveListing(), signer: builderKp.publicKey })
+          .signers([builderKp])
+          .rpc();
+      }
+
+      await program.methods
+        .guardianPauseListing()
+        .accountsPartial({ listing: liveListing(), guardian: guardian.publicKey })
+        .signers([guardian])
+        .rpc();
+
+      l = await program.account.agentListing.fetch(liveListing());
+      assert.ok("paused" in l.status, "guardian pause takes effect in the same transaction");
+    });
+
+    it("the guardian cannot un-pause what it paused", async () => {
+      // One-directional on purpose. An emergency key that could also restart an agent
+      // would be a key that can put capital back at risk; this one may only reduce
+      // exposure. Resuming stays with the builder or the authority.
+      await expectError(
+        program.methods
+          .resumeListing()
+          .accountsPartial({ builder: builderPda, listing: liveListing(), signer: guardian.publicKey })
+          .signers([guardian])
+          .rpc(),
+        "Unauthorized"
+      );
+
+      await program.methods
+        .resumeListing()
+        .accountsPartial({ builder: builderPda, listing: liveListing(), signer: builderKp.publicKey })
+        .signers([builderKp])
+        .rpc();
+    });
+
+    it("an impostor cannot use the guardian's emergency stop", async () => {
+      await expectError(
+        program.methods
+          .guardianPauseListing()
+          .accountsPartial({ listing: liveListing(), guardian: outsider.publicKey })
+          .signers([outsider])
+          .rpc(),
+        "NotGuardian"
+      );
+    });
+
+    it("only the authority may rotate the guardian", async () => {
+      await expectError(
+        program.methods
+          .setGuardian(outsider.publicKey)
+          .accountsPartial({ authority: guardian.publicKey })
+          .signers([guardian])
+          .rpc(),
+        "Unauthorized"
       );
     });
   });

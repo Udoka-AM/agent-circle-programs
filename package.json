@@ -3,11 +3,12 @@
   "license": "ISC",
   "scripts": {
     "build": "./scripts/build.sh",
-    "test": "./scripts/build.sh && anchor test --skip-build",
-    "test:fast": "anchor test --skip-build",
+    "test": "./scripts/build.sh --localnet && anchor test --skip-build",
+    "test:fast": "./scripts/check-localnet-build.sh && anchor test --skip-build",
     "devnet:walkthrough": "ts-node scripts/devnet-walkthrough.ts",
     "lint:fix": "prettier */*.js \"*/**/*{.js,.ts}\" -w",
-    "lint": "prettier */*.js \"*/**/*{.js,.ts}\" --check"
+    "lint": "prettier */*.js \"*/**/*{.js,.ts}\" --check",
+    "build:localnet": "./scripts/build.sh --localnet"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.31.1"
