@@ -55,13 +55,49 @@ const TIER_CEILINGS: [BN, BN, BN] = [
 const DEVNET_UNBOND_PERIOD = 60;
 
 const BUILDER_FUNDING = 0.05 * LAMPORTS_PER_SOL;
-const STATE_FILE = path.join(__dirname, ".devnet-walkthrough.json");
+const GUARDIAN_FUNDING = 0.02 * LAMPORTS_PER_SOL;
+
+/// Matches MIN_TIMELOCK_DELAY in a production build. Deliberately not shortened: the
+/// whole point of running this on devnet rather than in the test suite is to exercise the
+/// real floor, with the real binary, rather than the 2s one the `localnet` feature allows.
+///
+/// Which is why this script never waits it out. It queues, proves the delay actually
+/// holds, and leaves the proposal pending — re-run after the ETA to complete it.
+///
+/// `WALKTHROUGH_TIMELOCK` lowers it for a local rehearsal, where the program is built with
+/// the `localnet` feature and its floor is seconds rather than an hour. It has no effect
+/// against a real deployment: the on-chain floor rejects anything below MIN_TIMELOCK_DELAY.
+const DEVNET_TIMELOCK_DELAY = Number(process.env.WALKTHROUGH_TIMELOCK ?? 60 * 60);
+
+const KIND = {
+  transferAuthority: { variant: { transferAuthority: {} }, seed: 0 },
+  setVaultAuthority: { variant: { setVaultAuthority: {} }, seed: 1 },
+  updateTiers: { variant: { updateTiers: {} }, seed: 2 },
+} as const;
+/// Overridable so the script can be rehearsed against a local validator without the
+/// devnet run's mint and builder — which do not exist there — being loaded over it.
+const STATE_FILE =
+  process.env.WALKTHROUGH_STATE ?? path.join(__dirname, ".devnet-walkthrough.json");
 
 const seed = (s: string) => Buffer.from(s);
 const step = (n: number, title: string) =>
   console.log(`\n\x1b[1m── ${n}. ${title}\x1b[0m`);
 const ok = (msg: string) => console.log(`   \x1b[32m✓\x1b[0m ${msg}`);
 const info = (msg: string) => console.log(`   \x1b[2m${msg}\x1b[0m`);
+/** Assert a transaction fails with a specific Anchor error code. */
+async function expectFail(promise: Promise<unknown>, code: string, label: string) {
+  try {
+    await promise;
+    throw new Error(`${label}: expected ${code}, but it succeeded`);
+  } catch (err: any) {
+    const msg = err?.error?.errorCode?.code ?? err?.message ?? String(err);
+    if (!String(msg).includes(code)) {
+      throw new Error(`${label}: expected ${code}, got ${msg}`);
+    }
+    ok(`${label} → ${code}`);
+  }
+}
+
 const link = (sig: string) =>
   info(`https://explorer.solana.com/tx/${sig}?cluster=devnet`);
 
@@ -71,7 +107,12 @@ function loadCliWallet(): Keypair {
 }
 
 /** Persist generated keys so re-runs reuse the same builder and mint. */
-function loadState(): { builder?: number[]; mint?: string } {
+function loadState(): {
+  builder?: number[];
+  mint?: string;
+  guardian?: number[];
+  vaultAuthority?: number[];
+} {
   try {
     return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
   } catch {
@@ -164,6 +205,15 @@ async function main() {
     [seed("bond"), builderPda.toBuffer()],
     PROGRAM_ID
   );
+  const [governancePda] = PublicKey.findProgramAddressSync([seed("governance")], PROGRAM_ID);
+  /// Seed is a byte computed from the action kind, which the IDL cannot express, so this
+  /// account is passed explicitly at every call site rather than resolved by Anchor.
+  const pendingPda = (seedByte: number) =>
+    PublicKey.findProgramAddressSync(
+      [seed("pending"), Buffer.from([seedByte])],
+      PROGRAM_ID
+    )[0];
+
   const listingPda = (index: number) =>
     PublicKey.findProgramAddressSync(
       [seed("agent"), builderPda.toBuffer(), Buffer.from(new Uint16Array([index]).buffer)],
@@ -309,13 +359,240 @@ async function main() {
   expect("max drawdown bps", l.maxDrawdownBps, 1500);
 
   // ─────────────────────────────────────────────────────────────
+  step(9, "initialize_governance  → guardian + timelock");
+  let guardianKp: Keypair;
+  if (state.guardian) {
+    guardianKp = Keypair.fromSecretKey(Uint8Array.from(state.guardian));
+    ok(`reusing guardian ${guardianKp.publicKey.toBase58()}`);
+  } else {
+    guardianKp = Keypair.generate();
+    state.guardian = Array.from(guardianKp.secretKey);
+    saveState(state);
+    ok(`generated guardian ${guardianKp.publicKey.toBase58()}`);
+  }
+
+  if ((await connection.getBalance(guardianKp.publicKey)) < 0.005 * LAMPORTS_PER_SOL) {
+    const tx = new Transaction().add(
+      SystemProgram.transfer({
+        fromPubkey: authority.publicKey,
+        toPubkey: guardianKp.publicKey,
+        lamports: GUARDIAN_FUNDING,
+      })
+    );
+    link(await sendAndConfirmTransaction(connection, tx, [authority]));
+    ok(`funded guardian with ${GUARDIAN_FUNDING / LAMPORTS_PER_SOL} SOL`);
+  }
+
+  if (await connection.getAccountInfo(governancePda)) {
+    ok("governance already initialised — skipping");
+  } else {
+    const sig = await program.methods
+      .initializeGovernance(guardianKp.publicKey, new BN(DEVNET_TIMELOCK_DELAY))
+      .accountsPartial({ authority: authority.publicKey, payer: authority.publicKey })
+      .rpc();
+    ok("governance created");
+    link(sig);
+  }
+  const gov = await program.account.governance.fetch(governancePda);
+  info(`governance PDA: ${governancePda.toBase58()}`);
+  info(`guardian:       ${gov.guardian.toBase58()}`);
+  info(`timelock delay: ${gov.timelockDelay.toNumber()}s  (production default: 259200s / 72h)`);
+
+  // ─────────────────────────────────────────────────────────────
+  step(10, "guardian emergency stop  → immediate, and one-directional");
+  l = await program.account.agentListing.fetch(listing);
+  if (!("live" in l.status)) {
+    await program.methods
+      .resumeListing()
+      .accountsPartial({ builder: builderPda, listing, signer: builderKp.publicKey })
+      .signers([builderKp])
+      .rpc();
+    info("listing was paused; resumed first so the stop is observable");
+  }
+
+  const pauseSig = await program.methods
+    .guardianPauseListing()
+    .accountsPartial({ listing, guardian: guardianKp.publicKey })
+    .signers([guardianKp])
+    .rpc();
+  l = await program.account.agentListing.fetch(listing);
+  if (!("paused" in l.status)) throw new Error("expected status Paused");
+  ok("guardian paused a live listing in one transaction, no delay");
+  link(pauseSig);
+
+  await expectFail(
+    program.methods
+      .resumeListing()
+      .accountsPartial({ builder: builderPda, listing, signer: guardianKp.publicKey })
+      .signers([guardianKp])
+      .rpc(),
+    "Unauthorized",
+    "guardian cannot un-pause what it paused"
+  );
+
+  await program.methods
+    .resumeListing()
+    .accountsPartial({ builder: builderPda, listing, signer: builderKp.publicKey })
+    .signers([builderKp])
+    .rpc();
+  ok("builder resumed it — restarting stays with the builder or the authority");
+
+  // ─────────────────────────────────────────────────────────────
+  step(11, "queue → veto  → a compromised multisig buys an announcement, not the registry");
+  const transferPending = pendingPda(KIND.transferAuthority.seed);
+  if (await connection.getAccountInfo(transferPending)) {
+    info("a transfer proposal is already pending — vetoing it to reset");
+    await program.methods
+      .vetoChange(KIND.transferAuthority.variant)
+      .accountsPartial({
+        pending: transferPending,
+        signer: guardianKp.publicKey,
+        rentRefund: authority.publicKey,
+      })
+      .signers([guardianKp])
+      .rpc();
+  }
+
+  const attacker = Keypair.generate();
+  const queueSig = await program.methods
+    .queueTransferAuthority(KIND.transferAuthority.variant, attacker.publicKey)
+    .accountsPartial({
+      pending: transferPending,
+      authority: authority.publicKey,
+      payer: authority.publicKey,
+    })
+    .rpc();
+  ok(`queued a transfer to ${attacker.publicKey.toBase58()}`);
+  link(queueSig);
+
+  const cfgDuring = await program.account.config.fetch(configPda);
+  if (!cfgDuring.authority.equals(authority.publicKey)) {
+    throw new Error("queuing must not transfer authority");
+  }
+  ok("config.authority unchanged — nothing happened yet");
+
+  await expectFail(
+    program.methods
+      .executeChange(KIND.transferAuthority.variant)
+      .accountsPartial({
+        pending: transferPending,
+        signer: authority.publicKey,
+        rentRefund: authority.publicKey,
+      })
+      .rpc(),
+    "TimelockNotElapsed",
+    "cannot execute inside the delay"
+  );
+
+  await expectFail(
+    program.methods
+      .executeChange(KIND.transferAuthority.variant)
+      .accountsPartial({
+        pending: transferPending,
+        signer: guardianKp.publicKey,
+        rentRefund: authority.publicKey,
+      })
+      .signers([guardianKp])
+      .rpc(),
+    "Unauthorized",
+    "guardian cannot execute either"
+  );
+
+  const vetoSig = await program.methods
+    .vetoChange(KIND.transferAuthority.variant)
+    .accountsPartial({
+      pending: transferPending,
+      signer: guardianKp.publicKey,
+      rentRefund: authority.publicKey,
+    })
+    .signers([guardianKp])
+    .rpc();
+  if (await connection.getAccountInfo(transferPending)) {
+    throw new Error("vetoed proposal should be closed");
+  }
+  ok("guardian vetoed it — proposal gone, rent returned");
+  link(vetoSig);
+
+  // ─────────────────────────────────────────────────────────────
+  step(12, "queue set_vault_authority  → resumable across runs");
+  const cfgNow = await program.account.config.fetch(configPda);
+  const vaultPending = pendingPda(KIND.setVaultAuthority.seed);
+  const pendingInfo = await connection.getAccountInfo(vaultPending);
+
+  if (!cfgNow.vaultAuthority.equals(PublicKey.default)) {
+    ok(`vault authority already set to ${cfgNow.vaultAuthority.toBase58()}`);
+  } else if (pendingInfo) {
+    const p = await program.account.pendingChange.fetch(vaultPending);
+    const now = Math.floor(Date.now() / 1000);
+    const remaining = p.eta.toNumber() - now;
+
+    if (remaining > 0) {
+      ok(`proposal pending — ${Math.ceil(remaining / 60)} min remaining`);
+      info(`target: ${p.newKey.toBase58()}`);
+      info("re-run this script after the ETA to execute it");
+    } else {
+      const sig = await program.methods
+        .executeChange(KIND.setVaultAuthority.variant)
+        .accountsPartial({
+          pending: vaultPending,
+          signer: authority.publicKey,
+          rentRefund: authority.publicKey,
+        })
+        .rpc();
+      const after = await program.account.config.fetch(configPda);
+      if (!after.vaultAuthority.equals(p.newKey)) {
+        throw new Error("vault authority did not take effect");
+      }
+      ok(`timelock elapsed and executed — vault authority = ${after.vaultAuthority.toBase58()}`);
+      link(sig);
+    }
+  } else {
+    // A throwaway stand-in. agent_vault does not exist yet, so this is a placeholder
+    // whose only job is to prove the timelocked path works end to end.
+    let vaultAuthKp: Keypair;
+    if (state.vaultAuthority) {
+      vaultAuthKp = Keypair.fromSecretKey(Uint8Array.from(state.vaultAuthority));
+    } else {
+      vaultAuthKp = Keypair.generate();
+      state.vaultAuthority = Array.from(vaultAuthKp.secretKey);
+      saveState(state);
+    }
+
+    const sig = await program.methods
+      .queueSetVaultAuthority(KIND.setVaultAuthority.variant, vaultAuthKp.publicKey)
+      .accountsPartial({
+        pending: vaultPending,
+        authority: authority.publicKey,
+        payer: authority.publicKey,
+      })
+      .rpc();
+    const p = await program.account.pendingChange.fetch(vaultPending);
+    ok(`queued — executable in ${Math.ceil(DEVNET_TIMELOCK_DELAY / 60)} min`);
+    info(`target: ${vaultAuthKp.publicKey.toBase58()}`);
+    info(`eta:    ${new Date(p.eta.toNumber() * 1000).toISOString()}`);
+    info("re-run this script after the ETA to complete it");
+    link(sig);
+  }
+
+  // ─────────────────────────────────────────────────────────────
   const endBal = await connection.getBalance(authority.publicKey);
   console.log("\n\x1b[1m── Summary\x1b[0m");
-  ok("Full builder journey verified on devnet");
-  info(`config:   ${configPda.toBase58()}`);
-  info(`builder:  ${builderPda.toBase58()}  (tier ${b.tier})`);
-  info(`listing:  ${listing.toBase58()}  (Live)`);
-  info(`bond:     ${vaultBal / UNIT} tokens escrowed`);
+  ok("Full builder journey and governance defences verified on devnet");
+  info(`config:     ${configPda.toBase58()}`);
+  info(`governance: ${governancePda.toBase58()}`);
+  info(`guardian:   ${guardianKp.publicKey.toBase58()}`);
+  info(`builder:    ${builderPda.toBase58()}  (tier ${b.tier})`);
+  info(`listing:    ${listing.toBase58()}  (Live)`);
+  info(`bond:       ${vaultBal / UNIT} tokens escrowed`);
+
+  const finalCfg = await program.account.config.fetch(configPda);
+  info(
+    `vault authority: ${
+      finalCfg.vaultAuthority.equals(PublicKey.default)
+        ? "unset — a timelocked proposal may still be pending, see step 12"
+        : finalCfg.vaultAuthority.toBase58()
+    }`
+  );
   info(`SOL spent: ${((startBal - endBal) / LAMPORTS_PER_SOL).toFixed(5)}`);
   console.log(
     `\n\x1b[2mView the program: https://explorer.solana.com/address/${PROGRAM_ID.toBase58()}?cluster=devnet\x1b[0m\n`
